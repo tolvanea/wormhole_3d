@@ -111,69 +111,82 @@ once per flight, and hands the GPU a 176-byte uniform block per frame.
 4. **Camera path.** The camera is a point (l, u) — radial coordinate plus a
    position on the sphere of radius r(l) = √(l² + a²) — carrying an
    orthonormal (forward, up) frame, so it can look anywhere, not just down
-   the axis. The flight is in three acts:
+   the axis. The whole flight is a single continuous move; nothing stops and
+   there are no acts to stitch together.
 
-   * **Dive (frames 1–45).** l runs from +14a to 0, but the camera also
-     slides around the throat sphere by
+   The model flies the path. l runs monotonically +14a → −14a while the model
+   also slides around the throat sphere by
 
-         ψ(l) = K (g(14a) − g(l)),   g(l) = l / √(l² + a²)
+       ψ(l) = K (g(14a) − g(l)),   g(l) = l / √(l² + a²)
 
-     so that dψ/dl = −K a²/r³: the sideways drift falls off like 1/l³ and
-     essentially the whole turn is spent within a couple of throat radii of
-     l = 0. K is fixed by ψ(−14a) = π, i.e. **half a loop** around the
-     inside of the throat over the traversal. Instead of falling straight
-     in, the camera banks and the mouth swings out of frame.
+   so that dψ/dl = −K a²/r³: the sideways drift falls off like 1/l³ and
+   essentially the whole turn is spent within a couple of throat radii of
+   l = 0. K is fixed by ψ(−14a) = π, i.e. **half a loop** around the inside of
+   the throat over the traversal.
 
-     The heading is the path tangent taken not at the camera but at `l_aim`,
-     a fraction `AIM_LEAD` of the way to the chase model; since the tangent
-     at the middle of an arc is its chord, `AIM_LEAD` ≈ 0.5 aims straight at
-     the model and less than that lets it drift around the frame. A pure
-     tangent follower (`AIM_LEAD = 0`) looks 57.6° off the axis at l = 0.
+   The camera rides a geodesic sphere about it. Rather than flying its own
+   path, the camera stays a constant proper distance `ORBIT_DIST` from the
+   model, at a bearing that sweeps a full 2π over the flight. A circle
+   "around" something is awkward here: the connecting geodesic is bent, so
+   aiming along the naive chord would miss, and there is no chart in which a
+   constant-radius circle is a circle. Instead the camera is put at the far end
+   of a geodesic fired *out of* the model — sweep the launch direction, integrate
+   a fixed proper length, stand there facing back down it. Geodesics are
+   reversible, so this is exactly a constant-proper-distance orbit, lensing and
+   all. Bearing zero fires it back down the path, which puts the camera exactly
+   where a plain chase camera would be, so the orbit starts and ends in the
+   chase pose with nothing to blend.
 
-   * **Orbit (frames 46–81).** Parked at l = 0, the camera circles the chase
-     model once rather than spinning on the spot, so the model stays in
-     frame while both universes and the throat sweep past behind it.
+   The turn is concentrated at the wormhole. The bearing rate is a Lorentzian
+   in l, dθ/dl ∝ 1/(1 + (l/`ORBIT_SPREAD`)²), which integrates in closed form
+   to spread·atan(l/spread). The camera is therefore nearly steady out in the
+   open, eases into the turn a few throat radii out, and does the bulk of it
+   while crossing — and normalising by the total makes it exactly one turn end
+   to end, with no accumulated drift.
 
-     A circle "around" something is awkward here: the connecting geodesic is
-     bent, so aiming along the naive chord would miss, and there is no chart
-     in which a constant-radius circle is a circle. Instead the camera is
-     put at the far end of a geodesic fired *out of* the model: sweep the
-     launch direction through 2π about the up axis, integrate a fixed proper
-     length, and stand there facing back down the geodesic. Geodesics are
-     reversible, so this is exactly a constant-proper-radius orbit with the
-     model exactly in the middle of the frame, lensing and all. The launch
-     direction that starts the orbit on the parked pose comes from a
-     one-dimensional search (`sight_line`) for the geodesic joining the two —
-     the shortest one, since strong lensing means there are several.
+   Where the camera looks is blended, not fixed. Facing straight back down the
+   geodesic holds the model dead centre, which is what an orbit should do — but
+   held for the whole flight it also parks the model in front of the wormhole
+   mouth and eclipses it, which is the very thing `MODEL_RISE` exists to
+   prevent. So the heading blends between the flight direction and the model,
+   weighted by **bearing** rather than by l. The model sits at roughly the
+   bearing angle off the flight axis, so sin(θ/2) is zero behind the model
+   (where the two agree anyway), one in front of it, and enough in between to
+   keep the model within 28° of centre the whole way round — comfortably inside
+   the 40° half-FOV, and printed at startup so a regression cannot hide.
+   Keying that blend to l instead is a subtle trap: during the orbit the camera
+   swings beside and even ahead of the model, so an l-keyed weight releases far
+   too early and the model silently leaves the shot for a third of the flight.
 
-     Over the first radian of the orbit the camera sheds the 26° between its
-     flight heading and the true line of sight, and takes it back on over the
-     last, so the dive and the exit still join up cleanly. That lean is applied
-     as a rotation *of the sight line*, not as a blend towards the parked
-     heading: once the camera has moved, a fixed direction in map axes no
-     longer means what it did at the parked pose.
+   The timing comes from measuring, not from a formula. `pose_at` defines the
+   *curve* — a purely geometric object with no timing in it — and then the curve
+   is walked once, measuring how much the view actually changes along it
+   (turning, plus translation counted at one radian per orbit radius), and the
+   frames are placed at equal intervals of that. Near the throat the lensing
+   swings the view about ten times faster per unit of l than out in the open, so
+   equal steps in l would tear through the crossing and crawl through the rest;
+   equal steps in view change do the opposite. That is where the heavy slowdown
+   in the middle comes from — it is not imposed, it falls out of the geometry.
+   The model crosses the throat about **12× slower** than it cruises, and never
+   stops. `THROAT_DWELL` biases the measure further if you want more.
 
-     The frames are not spaced evenly in orbit angle. The orbit crosses the
-     throat twice, and there the lensing swings the view about ten times
-     faster than it does out in the open, so equal angular steps tear through
-     those few frames and crawl through the rest. `orbit_schedule` samples the
-     orbit finely, measures how much the view actually changes along it
-     (turning, plus translation counted at one radian per orbit radius) and
-     spaces the frames evenly in that instead, eased at both ends. Every frame
-     is still an exact pose on the true orbit; only the timing along it
-     changes. Startup prints the resulting average and worst per-frame turn
-     and the two joins, which is where a cut would show up.
+   Easing is applied at the two ends only (`END_RAMP`), as a smoothstep ramp on
+   the velocity. The obvious choice — a half cosine over the whole flight — puts
+   its peak speed exactly at the midpoint, which is precisely where the crossing
+   wants to be slowest, and it was the single largest source of leftover jerk.
 
-   * **Continue (frames 82–126).** The same curve, mirrored: l runs 0 →
-     −14a while ψ finishes its half turn to π, heading the way it was
-     originally going.
+   Startup prints the average and worst per-frame turn and translation. With
+   the flight built as one move these sit close together (4.4°/frame average
+   against an 11° worst, where the old three-act version managed 5.4° against
+   27°), and the peak now falls in the middle of the crossing rather than at a
+   frame index where two pieces used to meet.
 
    Watching the frames in order you see universe B grow from a lensed disc,
    an Einstein ring of universe A form and invert as you swing through the
-   throat, the two universes wheeling around the model during the orbit, and
-   universe A shrink to a receding disc behind you — with the helmet leading
-   the way through, lensed into a second copy and then stretched out as it
-   crosses.
+   throat, the two universes wheeling around the model as the camera comes all
+   the way round it, and universe A shrink to a receding disc behind you — with
+   the helmet leading the way through, lensed into a second copy and then
+   stretched out along the mouth as it crosses.
 
 The integrator conserves |v|² = 1 and the angular momentum
 L = √(l² + a²)·v̂_φ over a full traversal. Note the shader runs in f32, not the
@@ -202,13 +215,18 @@ that what you see is byte-for-byte what gets written.
 
 Flags: `--width`, `--height`, `--ssaa`, and `--model FILE.gltf` to fly
 something other than the helmet (it is centred and scaled to `MODEL_R`
-automatically). The scene constants live at the top of `src/scene.rs`: FOV,
-throat radius `A`, start/end distance (`L_START`/`L_END`), how far the camera
-loops around the throat (`LOOP_SWEEP`), how tightly the frames bunch up there
-(`PATH_BIAS`), the number of times the camera circles the model while parked
-(`ORBIT_TURNS`), the chase model itself
-(`MODEL_R`/`MODEL_LEAD`/`MODEL_RISE`/`MODEL_TURNS`/`AIM_LEAD`) and the per-act
-frame counts.
+automatically). The scene constants live at the top of `src/scene.rs`:
+
+| | |
+| --- | --- |
+| `A`, `FOV_DEG`, `FRAMES` | throat radius, field of view, length of the flight |
+| `L_START` / `L_END` | how far out the flight starts and ends |
+| `LOOP_SWEEP` | how far the path loops around the throat while crossing |
+| `ORBIT_TURNS` / `ORBIT_SPREAD` | turns the camera makes around the model, and how tightly they cluster at the wormhole |
+| `ORBIT_DIST` / `LOOK_GRIP` | how far the camera stands off, and how firmly it holds the model once it swings to the side |
+| `THROAT_DWELL` | extra frames spent on the crossing, beyond what even motion already gives it |
+| `END_RAMP` | how much of the flight is spent getting up to speed and back down |
+| `MODEL_R` / `MODEL_LEAD` / `MODEL_RISE` / `MODEL_TURNS` | the chase model's size, lead, height above the flight plane, and spin |
 
 For reference, the full 126-frame 1080p 2×2 render takes about 26 s end to end
 on an RX 7900 — and most of that is PNG and GIF encoding on the CPU, with the

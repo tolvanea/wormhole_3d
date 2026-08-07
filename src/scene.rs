@@ -38,16 +38,42 @@ pub const L_END: f64 = -14.0; // ... and ends here (universe B)
 /// all of it within a few throat radii of l = 0 -- a half loop inside the walls.
 pub const LOOP_SWEEP: f64 = PI;
 
-/// >1 puts more frames near the throat, where the turn happens.
-pub const PATH_BIAS: f64 = 1.6;
+pub const FRAMES: usize = 126; // length of the whole flight
 
-pub const FRAMES_IN: usize = 45; // universe A -> throat
-pub const FRAMES_ORBIT: usize = 36; // parked at the throat, circling the model
-pub const FRAMES_OUT: usize = 45; // throat -> universe B
-pub const ORBIT_TURNS: f64 = 1.0; // times the camera circles the model
-/// Radians of orbit spent settling from the flight heading onto the model,
-/// and again at the end returning to it.
-pub const ORBIT_LOCK: f64 = 1.0;
+/// Turns the camera makes around the model over the whole flight.
+pub const ORBIT_TURNS: f64 = 1.0;
+
+/// Half-width, in throat radii, of the region the camera does its turning in.
+///
+/// The orbit rate is weighted by 1 / (1 + (l/spread)^2), so the camera is
+/// already easing into the turn a few radii out and does the bulk of it while
+/// crossing. Because the weights are normalised over the frames, the total
+/// comes to exactly ORBIT_TURNS however the speed profile is tuned.
+pub const ORBIT_SPREAD: f64 = 3.0 * A;
+
+/// Proper distance the camera keeps from the model.
+///
+/// Constant for the whole flight, which is what makes the motion read as one
+/// move: the camera is on a geodesic sphere about the model, and the only
+/// thing that changes is the bearing.
+pub const ORBIT_DIST: f64 = MODEL_LEAD;
+
+/// How firmly the camera holds the model once it has swung off to one side.
+///
+/// Out in the open the camera looks along its own flight path, so the wormhole
+/// mouth is dead ahead and the model rides off to one side on its MODEL_RISE --
+/// the original framing, and the reason that constant exists. But that only
+/// works while the camera is *behind* the model. Once the orbit has carried it
+/// round to the side, the flight direction and the model are nearly a right
+/// angle apart, and looking along the flight would leave the model out of shot
+/// entirely.
+///
+/// So the blend is keyed to the bearing rather than to l: the model sits at
+/// about `bearing` off the flight axis, so weighting by sin(bearing/2) is zero
+/// where the camera is behind it (and the two agree anyway), one where the
+/// camera is in front, and enough in between to keep the residual inside 30
+/// degrees the whole way round. Raising this exponent grips harder.
+pub const LOOK_GRIP: f64 = 0.65;
 
 // The glTF model flies the same path ahead of the camera. l decreases
 // monotonically over the whole flight, so "ahead" is simply l - MODEL_LEAD.
@@ -74,10 +100,6 @@ pub const MODEL_LEAD: f64 = 2.5 * A; // how far ahead of the camera it flies
 pub const MODEL_RISE: f64 = 0.7 * A;
 pub const MODEL_LIGHT: [f64; 3] = [0.35, -0.25, 0.90]; // key light, model's frame
 pub const MODEL_TURNS: f64 = 4.0; // turns about its own z axis, whole flight
-
-/// How much the camera leans its heading toward the model: 0 follows its own
-/// tangent (model drifts freely), ~0.5 is the chord to it (locked on).
-pub const AIM_LEAD: f64 = 0.45;
 
 pub const L_ESCAPE: f64 = 25.0 * A; // |l| beyond which the ray is "at infinity"
 pub const H0: f64 = 0.02; // base integration step (scaled by sqrt(l^2+a^2))
@@ -199,10 +221,6 @@ pub struct Body {
 }
 
 impl Body {
-    pub fn offset(&self, l: f64, u: V3) -> V3 {
-        offset_from(self.l, self.u, l, u)
-    }
-
     /// The model's local orthonormal frame in map axes: outward radial, then
     /// the two directions across it. `b3` is the model's own z axis, which is
     /// the map's +z while it rides the flight plane -- so "up" for the model
@@ -214,91 +232,7 @@ impl Body {
     }
 }
 
-// ----------------------- looking at the model, exactly ----------------------
-
-const PROBE_STEPS: usize = 6_000;
-
-/// Closest approach to `target`'s centre of the geodesic that leaves
-/// (l0, p_hat) at angle `theta` from the outward radial, in the plane
-/// (p_hat, t_hat), as (miss distance, arc length there).
-fn probe(l0: f64, p_hat: V3, t_hat: V3, theta: f64, target: &Body) -> (f64, f64) {
-    let mut s = GState {
-        l: l0,
-        phi: 0.0,
-        vl: theta.cos(),
-        vphi: theta.sin() / (l0 * l0 + A * A).sqrt(),
-    };
-    let mut arc = 0.0;
-    let mut best = (f64::INFINITY, 0.0);
-    for _ in 0..PROBE_STEPS {
-        let d = target.offset(s.l, u_at(p_hat, t_hat, s.phi)).norm();
-        if d < best.0 {
-            best = (d, arc);
-        }
-        if s.l.abs() > L_ESCAPE && s.l * s.vl > 0.0 {
-            break;
-        }
-        let h = H0 * (s.l * s.l + A * A).sqrt();
-        s = rk4_step(&s, h);
-        arc += h;
-    }
-    best
-}
-
-/// The geodesic that joins (l0, u0) to `target`: its length, and the direction
-/// it sets off in. Any geodesic through two points lies in the plane spanned by
-/// the two positions, so this is a one-dimensional search over the launch angle
-/// in that plane -- run once per flight, not per ray.
-///
-/// Strong lensing means several geodesics connect the two points; the direct
-/// one is the shortest, so among the launch angles that reach the target the
-/// one with the least arc length wins.
-pub fn sight_line(l0: f64, u0: V3, target: &Body) -> (f64, V3) {
-    let t_hat = (target.u - u0 * u0.dot(&target.u)).normalize();
-    let scan = 720;
-    let step = 2.0 * PI / scan as f64;
-    let samples: Vec<(f64, f64, f64)> = (0..scan) // (theta, miss, arc)
-        .map(|i| {
-            let theta = -PI + step * i as f64;
-            let (miss, arc) = probe(l0, u0, t_hat, theta, target);
-            (theta, miss, arc)
-        })
-        .collect();
-    // The direct image is the shortest geodesic that reaches the target. Its
-    // arc length identifies which launch angles belong to it; of those, the one
-    // aimed best is the one that passes closest -- picking by arc length alone
-    // would drift to the near edge of the target instead of its centre.
-    let mut arc0 = f64::INFINITY;
-    for s in &samples {
-        if s.1 < target.r && s.2 < arc0 {
-            arc0 = s.2;
-        }
-    }
-    let mut pick = 0.0;
-    let mut best_miss = f64::INFINITY;
-    for s in &samples {
-        let direct = arc0.is_infinite() || (s.1 < target.r && s.2 < 1.2 * arc0);
-        if direct && s.1 < best_miss {
-            best_miss = s.1;
-            pick = s.0;
-        }
-    }
-    // Ternary search on the miss distance to line the geodesic up exactly.
-    let (mut lo, mut hi) = (pick - step, pick + step);
-    for _ in 0..25 {
-        let (a, b) = (lo + (hi - lo) / 3.0, hi - (hi - lo) / 3.0);
-        if probe(l0, u0, t_hat, a, target).0 < probe(l0, u0, t_hat, b, target).0 {
-            hi = b;
-        } else {
-            lo = a;
-        }
-    }
-    let theta = 0.5 * (lo + hi);
-    (
-        probe(l0, u0, t_hat, theta, target).1,
-        u_at(u0, t_hat, theta),
-    )
-}
+// ------------------------ standing off the model ---------------------------
 
 /// A camera standing on the geodesic sphere of radius `dist` about the model:
 /// shoot a geodesic out of the model in direction `e` and stand at its far end
@@ -331,52 +265,6 @@ pub fn orbit_camera(body: &Body, e: V3, dist: f64) -> (f64, V3, V3) {
         u_at(p_hat, t_hat, s.phi),
         -heading(&s, p_hat, t_hat), // face back the way we came
     )
-}
-
-/// Orbit angle for each of `frames` frames.
-///
-/// Not simply equal steps in angle: the orbit crosses the throat twice, and
-/// there the lensing swings the view an order of magnitude faster than it does
-/// out in the open, so equal angular steps tear through those few frames and
-/// crawl through the rest. Sample the orbit finely, measure how much the view
-/// really changes along it -- turning, plus translation counted at one radian
-/// per orbit radius -- and space the frames evenly in *that*, eased at both
-/// ends. Every frame is still an exact pose on the true orbit; only the timing
-/// along it changes.
-pub fn orbit_schedule(body: &Body, e0: V3, dist: f64, total: f64, frames: usize) -> Vec<f64> {
-    let n = 2000;
-    let mut cumulative = Vec::with_capacity(n + 1);
-    let mut seen = 0.0;
-    let mut prev: Option<(f64, V3, V3)> = None;
-    for i in 0..=n {
-        let a = total * i as f64 / n as f64;
-        let (l, u, fwd) = orbit_camera(body, rotate_about(e0, V3::z(), a), dist);
-        if let Some((pl, pu, pfwd)) = prev {
-            let moved = offset_from(pl, pu, l, u).norm() / dist;
-            let turned = pfwd.dot(&fwd).clamp(-1.0, 1.0).acos();
-            seen += (moved * moved + turned * turned).sqrt();
-        }
-        cumulative.push(seen);
-        prev = Some((l, u, fwd));
-    }
-
-    let mut out = Vec::with_capacity(frames);
-    let mut i = 0;
-    for f in 0..frames {
-        let t = f as f64 / frames as f64;
-        let want = seen * 0.5 * (1.0 - (PI * t).cos()); // slow-in / slow-out
-        while i + 1 < n && cumulative[i + 1] < want {
-            i += 1;
-        }
-        let (lo, hi) = (cumulative[i], cumulative[i + 1]);
-        let frac = if hi > lo {
-            (want - lo) / (hi - lo)
-        } else {
-            0.0
-        };
-        out.push(total * (i as f64 + frac) / n as f64);
-    }
-    out
 }
 
 // ------------------------------- camera path -------------------------------
@@ -436,25 +324,16 @@ pub fn body_at(l: f64) -> Body {
     }
 }
 
-/// Camera flying the path at radial coordinate `l`.
+/// Unit tangent of the flight path at radial coordinate `l`, pointing the way
+/// the flight is going (toward decreasing l).
 ///
-/// The heading is the path tangent evaluated at `l_aim` rather than at `l`,
-/// then re-expressed in the camera's own (radial, psi) basis. `l_aim = l`
-/// gives a pure tangent follower; pulling `l_aim` toward the chase model
-/// swings the heading into the turn, and since the tangent at the midpoint of
-/// an arc is its chord, `l_aim` half way to the model aims roughly at it.
-pub fn camera_on_path(l: f64, l_aim: f64) -> Camera {
+/// The tangential term is r * |dpsi/dl| = K a^2 / r^2, i.e. ~57 degrees off
+/// the axis at the throat and negligible far away.
+pub fn path_tangent(l: f64) -> V3 {
     let psi = path_psi(l);
     let u = V3::new(psi.cos(), psi.sin(), 0.0); // position on the sphere
     let e_psi = V3::new(-psi.sin(), psi.cos(), 0.0); // direction of increasing psi
-    // Unit tangent of the path, travelling toward decreasing l. The tangential
-    // term is r * |dpsi/dl| = K a^2 / r^2, i.e. ~57 degrees off the axis at the
-    // throat and negligible far away.
-    let fwd = (-u + e_psi * (sweep_k() * A * A / (l_aim * l_aim + A * A))).normalize();
-    // The path stays in the z = 0 plane of the map axes, so +z is a valid,
-    // constant "up" everywhere along it (no roll).
-    let up = V3::new(0.0, 0.0, 1.0);
-    Camera { l, u, fwd, up }
+    (-u + e_psi * (sweep_k() * A * A / (l * l + A * A))).normalize()
 }
 
 /// Screen up for a free camera: +z straightened against the viewing direction.
@@ -462,12 +341,7 @@ pub fn up_for(fwd: V3) -> V3 {
     (V3::z() - fwd * fwd.z).normalize()
 }
 
-pub fn smoothstep(x: f64) -> f64 {
-    let x = x.clamp(0.0, 1.0);
-    x * x * (3.0 - 2.0 * x)
-}
-
-// ------------------------------- flight plan -------------------------------
+// ------------------------------- the flight ---------------------------------
 
 /// One posed frame of the flight: where the camera is, and where the model is.
 #[derive(Clone, Copy)]
@@ -476,108 +350,199 @@ pub struct Shot {
     pub body: Body,
 }
 
-/// The whole scripted flight: dive in (turning half way around the throat on
-/// the way), park at l = 0 and circle the model, then resume the curve outward.
+/// How densely the curve is sampled before the frames are placed on it, and
+/// how much that sampling leans toward the throat. Neither is a timing choice
+/// -- the timing comes out of the measurement below -- they only decide how
+/// finely the interesting part gets measured.
+const CURVE_SAMPLES: usize = 20_000;
+const SAMPLE_BIAS: f64 = 0.05;
+
+/// A monotone sweep of l from L_START to L_END, used only to enumerate the
+/// curve. The odd cubic s(x) = c*x + (1-c)*x^3 is increasing everywhere
+/// (s'(x) = c + 3(1-c)x^2 >= c > 0), so this never doubles back, and its
+/// shallow slope at x = 0 puts more samples near the throat.
+fn l_sample(q: f64) -> f64 {
+    let x = 1.0 - 2.0 * q.clamp(0.0, 1.0);
+    let s = SAMPLE_BIAS * x + (1.0 - SAMPLE_BIAS) * x * x * x;
+    // Mapped per side so that s = 0 is the throat even if the two ends are not
+    // the same distance out.
+    if s >= 0.0 { L_START * s } else { -L_END * s }
+}
+
+/// Bearing of the camera around the model, as a function of where the model is.
+///
+/// The turn rate is a Lorentzian in l,
+///
+///     dtheta/dl  proportional to  1 / (1 + (l/spread)^2)
+///
+/// which integrates to spread * atan(l/spread) in closed form. So the camera is
+/// nearly steady out in the open, eases into the turn a few throat radii out,
+/// and does the bulk of it while crossing -- and normalising by the total makes
+/// it exactly ORBIT_TURNS from one end of the flight to the other, with no
+/// accumulated drift.
+fn bearing_at(l: f64) -> f64 {
+    let f = |x: f64| ORBIT_SPREAD * (x / ORBIT_SPREAD).atan();
+    ORBIT_TURNS * 2.0 * PI * (f(L_START) - f(l)) / (f(L_START) - f(L_END))
+}
+
+/// Where the camera is, and where the model is, when the model has reached `l`.
+///
+/// The camera is placed by firing a geodesic *out of* the model and standing at
+/// its far end facing back down it. Geodesics are reversible, so this is exactly
+/// a constant-proper-distance orbit with the model held in frame, lensing and
+/// all. There is no chart here in which a constant-radius circle would be a
+/// circle, and aiming along the naive chord would simply miss.
+fn pose_at(l: f64) -> Shot {
+    let body = body_at(l);
+    // Bearing zero fires the geodesic back down the path, which puts the camera
+    // exactly where a chase camera would be: behind the model, looking the way
+    // it is going. Everything after that is one long swing around to the same
+    // place.
+    let behind = -path_tangent(body.l);
+    let bearing = bearing_at(l);
+    let e = rotate_about(behind, V3::z(), bearing);
+    let (cl, cu, at_model) = orbit_camera(&body, e, ORBIT_DIST);
+    // Facing straight back down the geodesic holds the model in the middle of
+    // the frame, which is what an orbit should do -- but held for the whole
+    // flight it also parks the model right in front of the wormhole mouth and
+    // eclipses it. So only look at the model near the throat, and look where
+    // the flight is going the rest of the time.
+    let w = (0.5 * bearing).sin().abs().powf(LOOK_GRIP);
+    // "The way the flight is going", evaluated at the camera's *own* position.
+    // Taking it from the path instead only works while the camera is still on
+    // the path; once the orbit has carried it round, the path's tangent is a
+    // direction belonging to some other point entirely, and aiming along it
+    // points the camera at empty sky. -u is the way l decreases at any point,
+    // which is the direction of travel everywhere, both universes included.
+    let psi_cam = cu.y.atan2(cu.x);
+    let e_psi = V3::new(-psi_cam.sin(), psi_cam.cos(), 0.0);
+    let along = (-cu + e_psi * (sweep_k() * A * A / (cl * cl + A * A))).normalize();
+    let axis = along.cross(&at_model);
+    let fwd = if axis.norm() > 1e-9 {
+        let angle = along.dot(&at_model).clamp(-1.0, 1.0).acos();
+        rotate_about(along, axis.normalize(), w * angle)
+    } else {
+        at_model
+    };
+    Shot {
+        cam: Camera {
+            l: cl,
+            u: cu,
+            fwd,
+            up: up_for(fwd),
+        },
+        body,
+    }
+}
+
+/// How much the view changes between two poses: turning, plus translation
+/// counted at one radian per orbit radius. This is the quantity the frames are
+/// spaced evenly in, and it is why the flight comes out smooth.
+fn view_change(a: &Camera, b: &Camera) -> f64 {
+    let moved = offset_from(a.l, a.u, b.l, b.u).norm() / ORBIT_DIST;
+    let turned = a.fwd.dot(&b.fwd).clamp(-1.0, 1.0).acos();
+    (moved * moved + turned * turned).sqrt()
+}
+
+/// Fraction of the flight spent ramping up to speed at the start, and back down
+/// at the end.
+pub const END_RAMP: f64 = 0.18;
+
+/// Eased progress through the flight: a gentle ramp in and out at the two ends,
+/// steady in between.
+///
+/// The obvious easing -- a half cosine over the whole flight -- has its peak
+/// speed exactly at the midpoint, which is precisely where the throat crossing
+/// wants to be slowest. It was the single largest source of the leftover jerk.
+/// Ramping only over the first and last END_RAMP keeps the gentle start and
+/// stop without stealing from the middle.
+///
+/// The velocity is a smoothstep over each ramp and flat between, so this is its
+/// integral, normalised to land on exactly 1.
+fn eased(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    let r = END_RAMP.clamp(1e-6, 0.5);
+    // Integral of the smoothstep 3x^2 - 2x^3, which comes to 1/2 over [0, 1].
+    let ramp = |x: f64| x * x * x - 0.5 * x * x * x * x;
+    let total = 1.0 - r;
+    let d = if t <= r {
+        r * ramp(t / r)
+    } else if t < 1.0 - r {
+        t - 0.5 * r
+    } else {
+        total - r * ramp((1.0 - t) / r)
+    };
+    d / total
+}
+
+/// Extra frames to spend near the throat, over and above what even motion
+/// already asks for.
+///
+/// Spacing the frames evenly in view change already slows the crossing down a
+/// long way by itself, because the lensing there swings the view about ten
+/// times faster per unit of l than it does out in the open. This weights the
+/// measure on top of that: at the throat a unit of view change is treated as
+/// THROAT_DWELL units, so it gets that many times more frames. 1.0 disables it.
+pub const THROAT_DWELL: f64 = 1.6;
+
+// ------------------------------- flight plan -------------------------------
+
+/// The whole flight, as one continuous move.
+///
+/// There are no longer three acts to stitch together, and nothing comes to a
+/// stop: `l` runs monotonically from L_START to L_END while the camera rides a
+/// geodesic sphere of constant proper radius about the model, sweeping
+/// ORBIT_TURNS all the way round as it goes.
+///
+/// What makes it smooth is that the frames are not spaced evenly in `l`, nor
+/// evenly in bearing. `pose_at` defines the *curve* -- a purely geometric
+/// object with no timing in it -- and then the curve is walked once, measuring
+/// how much the view actually changes along it, and the frames are placed at
+/// equal intervals of that. Near the throat the lensing swings the view about
+/// ten times faster per unit of l than it does out in the open, so equal steps
+/// in l would tear through the crossing and crawl through the rest; equal steps
+/// in view change do the opposite, which is exactly the heavy slowdown in the
+/// middle that the crossing wants. Every frame is still an exact pose on the
+/// true curve -- only the timing along it changes.
 ///
 /// Both the live viewer and the headless renderer walk this same list, so what
 /// you see in the window is exactly what gets written to disk.
 pub fn flight_plan() -> Vec<Shot> {
-    let ease = |t: f64| 0.5 * (1.0 - (PI * t).cos()); // slow-in / slow-out
-    // Fraction of the way out from the throat after an eased time t of a leg:
-    // 1 at the far end, 0 at the throat, and with zero speed at both.
-    let leg = |t: f64| (1.0 - ease(t)).powf(PATH_BIAS);
-    // The camera chases the model: it leans AIM_LEAD of the way from its own
-    // tangent toward the chord, so the model sits loosely in frame instead of
-    // being pinned to the centre.
-    let pose = |l: f64| camera_on_path(l, l - AIM_LEAD * MODEL_LEAD);
+    // Walk the curve once and accumulate how far the view has travelled.
+    let ls: Vec<f64> = (0..=CURVE_SAMPLES)
+        .map(|i| l_sample(i as f64 / CURVE_SAMPLES as f64))
+        .collect();
+    let mut cumulative = Vec::with_capacity(ls.len());
+    cumulative.push(0.0);
+    let mut seen = 0.0;
+    let mut prev = pose_at(ls[0]).cam;
+    for &l in &ls[1..] {
+        let cam = pose_at(l).cam;
+        // Weighted so the throat can be given more frames than even motion
+        // alone would hand it.
+        let dwell = 1.0 + (THROAT_DWELL - 1.0) / (1.0 + (l / ORBIT_SPREAD).powi(2));
+        seen += dwell * view_change(&prev, &cam);
+        cumulative.push(seen);
+        prev = cam;
+    }
 
-    let mut shots: Vec<Shot> = Vec::new();
-    for f in 0..FRAMES_IN {
-        // Decelerates into the throat; the l = 0 frame belongs to the orbit.
-        let t = f as f64 / FRAMES_IN as f64;
-        let l = L_START * leg(t);
-        shots.push(Shot {
-            cam: pose(l),
-            body: body_at(l),
-        });
-    }
-    {
-        // Parked at the throat, the camera circles the model rather than
-        // spinning on the spot, so the model stays in frame throughout.
-        let park = pose(0.0);
-        let model = body_at(0.0);
-        // Solve for the geodesic that leaves the model and arrives at the
-        // parked camera: its length is the orbit radius, its launch direction
-        // is where the orbit starts. Searching outwards from the model rather
-        // than inwards from the camera puts the residual error at the camera
-        // end, instead of letting the lensing in between amplify it.
-        let eye = Body {
-            l: park.l,
-            u: park.u,
-            r: MODEL_R,
-            spin: 0.0,
-        };
-        let (dist, e0) = sight_line(model.l, model.u, &eye);
-        let start = orbit_camera(&model, e0, dist);
-        eprintln!(
-            "orbit: radius {:.3}, starts {:.3} from the parked camera, \
-             {:.1} deg off its heading",
-            dist,
-            eye.offset(start.0, start.1).norm(),
-            start.2.dot(&park.fwd).acos().to_degrees()
-        );
-        // The flight heading and the line to the model differ by a fixed
-        // rotation. Shedding it over the first radians of the orbit (and
-        // taking it back on over the last) lets the dive and the exit -- still
-        // tangent followers -- join up cleanly, while never swinging further
-        // than that from the model. Blending towards the parked heading as a
-        // *vector* would not do: once the camera has moved, a fixed direction
-        // in map axes no longer means the same thing.
-        // Axis order matters: rotating the sight line about (sight x heading)
-        // by +angle lands on the heading, the other way round doubles the gap.
-        let lean = start.2.cross(&park.fwd);
-        let (lean_axis, lean_angle) = if lean.norm() > 1e-9 {
-            (
-                lean.normalize(),
-                start.2.dot(&park.fwd).clamp(-1.0, 1.0).acos(),
-            )
-        } else {
-            (V3::z(), 0.0)
-        };
-        let total = ORBIT_TURNS * 2.0 * PI;
-        let schedule = orbit_schedule(&model, e0, dist, total, FRAMES_ORBIT);
-        for &a in &schedule {
-            let (l, u, fwd_model) = orbit_camera(&model, rotate_about(e0, V3::z(), a), dist);
-            // Shed the lean over the first radians of the orbit and take it
-            // back on over the last. Measured in orbit angle, not frames, so
-            // that it is fully off at a = 0 and fully back on as a returns to
-            // 2*pi -- which is exactly where the two joins with the flight are.
-            let w = smoothstep(a.min(total - a) / ORBIT_LOCK);
-            let axis = rotate_about(lean_axis, V3::z(), a);
-            let fwd = rotate_about(fwd_model, axis, (1.0 - w) * lean_angle);
-            shots.push(Shot {
-                cam: Camera {
-                    l,
-                    u,
-                    fwd,
-                    up: up_for(fwd),
-                },
-                body: model,
-            });
+    // Place the frames at equal intervals of that, eased at both ends so the
+    // flight opens and closes gently rather than starting at full speed.
+    let mut shots: Vec<Shot> = Vec::with_capacity(FRAMES);
+    let mut i = 0;
+    for f in 0..FRAMES {
+        let t = f as f64 / (FRAMES - 1) as f64;
+        let want = seen * eased(t);
+        while i + 1 < CURVE_SAMPLES && cumulative[i + 1] < want {
+            i += 1;
         }
-    }
-    for f in 0..FRAMES_OUT {
-        // Mirror image of the dive: accelerates away from the throat.
-        let t = (f + 1) as f64 / FRAMES_OUT as f64;
-        let l = L_END * leg(1.0 - t);
-        shots.push(Shot {
-            cam: pose(l),
-            body: body_at(l),
-        });
+        let (lo, hi) = (cumulative[i], cumulative[i + 1]);
+        let frac = if hi > lo { (want - lo) / (hi - lo) } else { 0.0 };
+        shots.push(pose_at(ls[i] + frac * (ls[i + 1] - ls[i])));
     }
 
     // The model turns steadily on its own axis for the whole flight, so it is
-    // visibly spinning even while the camera is parked and circling it.
+    // visibly spinning even while the camera is swinging around it.
     let frames = shots.len();
     for (f, shot) in shots.iter_mut().enumerate() {
         shot.body.spin = MODEL_TURNS * 2.0 * PI * f as f64 / frames as f64;
@@ -585,29 +550,103 @@ pub fn flight_plan() -> Vec<Shot> {
     shots
 }
 
-/// A cut shows up as one frame that turns much further than its neighbours, so
-/// report the worst of them: it should stay in the same league as the average,
-/// and in particular not spike at the two joins with the flight.
+/// Report how evenly the flight moves.
+///
+/// A cut, or a leftover seam between two differently-parametrised stretches,
+/// shows up as one frame that turns or travels much further than its
+/// neighbours. So print the worst of each against the average: with the flight
+/// built as a single move these should now sit close together, and the peak
+/// should be somewhere in the middle of the throat crossing rather than at a
+/// particular frame index where two pieces used to meet.
 pub fn report_continuity(shots: &[Shot]) {
     let turn = |a: &Camera, b: &Camera| a.fwd.dot(&b.fwd).clamp(-1.0, 1.0).acos().to_degrees();
-    let (mut worst, mut at, mut sum) = (0.0f64, 0, 0.0);
+    let (mut worst_turn, mut turn_at, mut turn_sum) = (0.0f64, 0, 0.0);
+    let (mut worst_move, mut move_at, mut move_sum) = (0.0f64, 0, 0.0);
     for (f, w) in shots.windows(2).enumerate() {
         let d = turn(&w[0].cam, &w[1].cam);
-        sum += d;
-        if d > worst {
-            worst = d;
-            at = f;
+        turn_sum += d;
+        if d > worst_turn {
+            worst_turn = d;
+            turn_at = f;
+        }
+        // Proper distance the camera actually covered between the two frames.
+        let m = offset_from(w[0].cam.l, w[0].cam.u, w[1].cam.l, w[1].cam.u).norm();
+        move_sum += m;
+        if m > worst_move {
+            worst_move = m;
+            move_at = f;
         }
     }
-    let join = |f: usize| turn(&shots[f].cam, &shots[f + 1].cam);
+    let n = (shots.len() - 1) as f64;
     eprintln!(
         "camera: turns {:.1} deg/frame on average, at most {:.1} deg (frames {} -> {}); \
-         joins {:.2} and {:.2} deg",
-        sum / (shots.len() - 1) as f64,
-        worst,
-        at,
-        at + 1,
-        join(FRAMES_IN - 1),
-        join(FRAMES_IN + FRAMES_ORBIT - 1)
+         moves {:.3}/frame, at most {:.3} (frames {} -> {})",
+        turn_sum / n,
+        worst_turn,
+        turn_at,
+        turn_at + 1,
+        move_sum / n,
+        worst_move,
+        move_at,
+        move_at + 1,
+    );
+
+    // Where the model actually sits in frame. Keeping it there is the whole
+    // job of the bearing-keyed look blend, and it is the thing that silently
+    // broke when the blend was keyed to l instead -- the model simply left the
+    // shot for a third of the flight. Measured in the model's flat
+    // neighbourhood, so it reads a little off where the lensing is strongest,
+    // but more than enough to catch it walking out of frame.
+    let (mut worst_off, mut off_at) = (0.0f64, 0);
+    for (f, s) in shots.iter().enumerate() {
+        let to_model = offset_from(s.cam.l, s.cam.u, s.body.l, s.body.u);
+        if to_model.norm() > 1e-9 {
+            let off = s
+                .cam
+                .fwd
+                .dot(&to_model.normalize())
+                .clamp(-1.0, 1.0)
+                .acos()
+                .to_degrees();
+            if off > worst_off {
+                worst_off = off;
+                off_at = f;
+            }
+        }
+    }
+    eprintln!(
+        "framing: model stays within {:.0} deg of centre (worst at frame {}), \
+         against a half-FOV of {:.0} deg",
+        worst_off,
+        off_at,
+        0.5 * FOV_DEG
+    );
+
+    // The model's own pace along l, which is the thing that is meant to dip in
+    // the middle without reaching zero. Measured against the fastest stretch of
+    // the flight rather than against the slowest: the slowest steps of all are
+    // the first and last, where the flight is deliberately ramping up to speed,
+    // and comparing the throat with those would flatter it enormously.
+    let steps: Vec<f64> = shots
+        .windows(2)
+        .map(|w| (w[0].body.l - w[1].body.l).abs())
+        .collect();
+    let cruise = steps.iter().copied().fold(0.0, f64::max);
+    // The step straddling the throat, i.e. the one whose midpoint sits closest
+    // to l = 0.
+    let throat_i = (0..steps.len())
+        .min_by(|&i, &j| {
+            let m = |k: usize| (shots[k].body.l + shots[k + 1].body.l).abs();
+            m(i).total_cmp(&m(j))
+        })
+        .unwrap_or(0);
+    let throat = steps[throat_i];
+    eprintln!(
+        "model: crosses the throat at {:.3} in l per frame against {:.3} at full \
+         cruise ({:.1}x slower, never stopped), camera turns {:.2} of a circle",
+        throat,
+        cruise,
+        cruise / throat.max(1e-12),
+        ORBIT_TURNS,
     );
 }
