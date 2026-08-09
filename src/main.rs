@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 const SKY_A: &str = "cubemap/cubemap_1.jpg"; // sky seen at l -> +inf
 const SKY_B: &str = "cubemap/cubemap_2.png"; // sky seen at l -> -inf
-const MODEL: &str = "gltf_models/FlightHelmet/FlightHelmet.gltf";
+const MODEL: &str = "gltf_models/space_pony/space_pony.gltf";
 
 const GIF_EVERY: usize = 1; // put every n-th frame into the GIF
 const GIF_DELAY_MS: u32 = 50; // 20 fps

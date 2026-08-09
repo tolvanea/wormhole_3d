@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 bytemuck = { version = "1.25.2", features = ["derive"] }
-gltf = "1.4.1"
+gltf = { version = "1.4.1", features = ["KHR_materials_emissive_strength"] }
 image = { version = "0.24", default-features = false, features = ["png", "gif", "jpeg"] }
 nalgebra = "0.35.0"
 pollster = "1.0.1"

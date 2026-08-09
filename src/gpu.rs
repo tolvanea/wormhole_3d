@@ -86,6 +86,7 @@ pub struct Renderer {
 struct SceneResources {
     tris: wgpu::Buffer,
     nodes: wgpu::Buffer,
+    materials: wgpu::Buffer,
     model_view: wgpu::TextureView,
     model_samp: wgpu::Sampler,
     sky_a: wgpu::TextureView,
@@ -149,6 +150,12 @@ impl Renderer {
             usage: wgpu::BufferUsages::STORAGE,
         });
 
+        let materials = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("materials"),
+            contents: bytemuck::cast_slice(&model.materials),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
         let model_view = upload_model_textures(&device, &queue, model);
         let model_samp = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("model sampler"),
@@ -192,6 +199,7 @@ impl Renderer {
                 texture_entry(6, wgpu::TextureViewDimension::Cube),
                 texture_entry(7, wgpu::TextureViewDimension::Cube),
                 sampler_entry(8),
+                storage_buffer_entry(9),
             ],
         });
         let tracer_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -245,6 +253,7 @@ impl Renderer {
             scene_entries: SceneResources {
                 tris,
                 nodes,
+                materials,
                 model_view,
                 model_samp,
                 sky_a: sky_a_view,
@@ -334,6 +343,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: wgpu::BindingResource::Sampler(&s.sky_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: s.materials.as_entire_binding(),
                 },
             ],
         });

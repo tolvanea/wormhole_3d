@@ -67,17 +67,44 @@ pub struct GpuNode {
     pub count: u32,
 }
 
-/// One base colour image with its mip chain, mip 0 first.
+/// glTF's three ways of treating the alpha channel.
+pub const ALPHA_OPAQUE: u32 = 0;
+pub const ALPHA_MASK: u32 = 1;
+pub const ALPHA_BLEND: u32 = 2;
+
+/// Everything the shader needs to know about one material.
+///
+/// Triangles carry a material index rather than a texture layer, which is what
+/// lets a material have no texture at all: the pony's teeth, tongue, eyelashes
+/// and glowing pip are pure `baseColorFactor`, and before this they were being
+/// silently textured with whatever happened to be in layer 0.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+pub struct GpuMaterial {
+    /// baseColorFactor, RGBA. Multiplies the texture where there is one.
+    pub base_color: [f32; 4],
+    /// emissiveFactor already multiplied by KHR_materials_emissive_strength.
+    pub emissive: [f32; 3],
+    pub alpha_cutoff: f32,
+    /// Layer in the texture array, or -1 for "no texture, use the factor".
+    pub base_tex: i32,
+    pub emissive_tex: i32,
+    pub alpha_mode: u32,
+    pub _pad: u32,
+}
+
+/// One image with its mip chain, mip 0 first.
 pub struct Tex {
     pub mips: Vec<Vec<u8>>,
 }
 
-/// The loaded model: GPU-ready triangles, BVH, and the base colour textures.
+/// The loaded model: GPU-ready triangles, BVH, materials and textures.
 pub struct Model {
     pub tris: Vec<GpuTri>,
     pub nodes: Vec<GpuNode>,
-    /// One layer per unique base colour image, all at `tex_size` with the same
-    /// number of mip levels.
+    pub materials: Vec<GpuMaterial>,
+    /// One layer per unique image, all at `tex_size` with the same number of
+    /// mip levels. Base colour and emissive share the array.
     pub textures: Vec<Tex>,
     pub tex_size: u32,
     pub mip_levels: u32,
@@ -119,32 +146,65 @@ impl Model {
             buffers.push(data);
         }
 
-        // Unique base colour images, and the material -> layer table. Several
-        // materials share an image (the hose and the wood parts do), so the
-        // texture array only holds the distinct ones.
+        // Materials, and the unique images they point at. Base colour and
+        // emissive images share one array, since several materials reuse the
+        // same file and the shader indexes both the same way.
         let mut image_paths: Vec<PathBuf> = Vec::new();
-        let mut mat_layer: Vec<u32> = Vec::new();
+        let mut intern = |src: Option<gltf::texture::Info>| -> i32 {
+            let Some(info) = src else { return -1 };
+            match info.texture().source().source() {
+                gltf::image::Source::Uri { uri, .. } => {
+                    let p = dir.join(percent_decode(uri));
+                    match image_paths.iter().position(|q| *q == p) {
+                        Some(i) => i as i32,
+                        None => {
+                            image_paths.push(p);
+                            image_paths.len() as i32 - 1
+                        }
+                    }
+                }
+                // An image packed into the .bin would need decoding out of the
+                // buffer view; no model here uses it, so treat it as untextured
+                // rather than pretending some other layer belongs to it.
+                gltf::image::Source::View { .. } => -1,
+            }
+        };
+
+        let mut materials: Vec<GpuMaterial> = Vec::new();
         for mat in doc.materials() {
-            let layer = mat
-                .pbr_metallic_roughness()
-                .base_color_texture()
-                .and_then(|info| match info.texture().source().source() {
-                    gltf::image::Source::Uri { uri, .. } => Some(dir.join(uri)),
-                    // A base colour packed into the .bin would need decoding
-                    // from the buffer view; the sample model does not use it.
-                    gltf::image::Source::View { .. } => None,
-                })
-                .map(|p| {
-                    image_paths.iter().position(|q| *q == p).unwrap_or_else(|| {
-                        image_paths.push(p);
-                        image_paths.len() - 1
-                    }) as u32
-                })
-                // Materials with no base colour texture fall back to layer 0;
-                // the shader tints by nothing, so they read as plain albedo.
-                .unwrap_or(0);
-            mat_layer.push(layer);
+            let pbr = mat.pbr_metallic_roughness();
+            let alpha_mode = match mat.alpha_mode() {
+                gltf::material::AlphaMode::Opaque => ALPHA_OPAQUE,
+                gltf::material::AlphaMode::Mask => ALPHA_MASK,
+                gltf::material::AlphaMode::Blend => ALPHA_BLEND,
+            };
+            // KHR_materials_emissive_strength scales the factor; folding it in
+            // here means the shader never has to know the extension exists.
+            let strength = mat.emissive_strength().unwrap_or(1.0);
+            let e = mat.emissive_factor();
+            materials.push(GpuMaterial {
+                base_color: pbr.base_color_factor(),
+                emissive: [e[0] * strength, e[1] * strength, e[2] * strength],
+                alpha_cutoff: mat.alpha_cutoff().unwrap_or(0.5),
+                base_tex: intern(pbr.base_color_texture()),
+                emissive_tex: intern(mat.emissive_texture()),
+                alpha_mode,
+                _pad: 0,
+            });
         }
+        // A primitive may have no material at all, in which case glTF says to
+        // use the default: white, opaque, untextured. Kept last so existing
+        // indices are untouched.
+        let default_material = materials.len() as u32;
+        materials.push(GpuMaterial {
+            base_color: [1.0, 1.0, 1.0, 1.0],
+            emissive: [0.0; 3],
+            alpha_cutoff: 0.5,
+            base_tex: -1,
+            emissive_tex: -1,
+            alpha_mode: ALPHA_OPAQUE,
+            _pad: 0,
+        });
 
         // Geometry. Node transforms are walked so that a model with a rigged
         // hierarchy still lands in the right place; FlightHelmet's are all
@@ -155,7 +215,13 @@ impl Model {
             .or_else(|| doc.scenes().next())
             .ok_or_else(|| anyhow!("the glTF file contains no scenes: {}", path.display()))?;
         for node in scene.nodes() {
-            visit_node(&node, nalgebra::Matrix4::identity(), &buffers, &mat_layer, &mut tris);
+            visit_node(
+                &node,
+                nalgebra::Matrix4::identity(),
+                &buffers,
+                default_material,
+                &mut tris,
+            );
         }
         if tris.is_empty() {
             bail!(
@@ -211,22 +277,79 @@ impl Model {
         let nodes = build_bvh(&mut tris);
 
         eprintln!(
-            "model: {} triangles, {} BVH nodes, {} base colour layer(s) at {}x{} ({} mips)",
+            "model: {} triangles, {} BVH nodes, {} material(s), {} texture layer(s) \
+             at {}x{} ({} mips)",
             tris.len(),
             nodes.len(),
+            materials.len(),
             textures.len(),
             tex_size,
             tex_size,
             mip_levels
         );
+        report_materials(&doc, &materials, &textures);
 
         Ok(Model {
             tris,
             nodes,
+            materials,
             textures,
             tex_size,
             mip_levels,
         })
+    }
+}
+
+/// Say which materials are see-through or glowing, and -- for the blended ones
+/// -- how much alpha their texture actually carries.
+///
+/// A material marked BLEND whose texture is solid alpha renders exactly like an
+/// opaque one, which looks like the transparency support is broken when it is
+/// really the asset saying "fully opaque". Worth one line at startup to tell
+/// those two cases apart.
+fn report_materials(doc: &gltf::Gltf, materials: &[GpuMaterial], textures: &[Tex]) {
+    let names: Vec<String> = doc
+        .materials()
+        .map(|m| m.name().unwrap_or("<unnamed>").to_string())
+        .collect();
+    for (i, m) in materials.iter().enumerate() {
+        let name = names.get(i).map(String::as_str).unwrap_or("<default>");
+        if m.alpha_mode != ALPHA_OPAQUE {
+            let kind = if m.alpha_mode == ALPHA_MASK {
+                format!("masked at {:.2}", m.alpha_cutoff)
+            } else {
+                "blended".to_string()
+            };
+            // Mean alpha over the smallest mip that still has some area, which
+            // is a cheap stand-in for "how transparent is this on average".
+            let coverage = if m.base_tex >= 0 {
+                textures
+                    .get(m.base_tex as usize)
+                    .and_then(|t| t.mips.iter().rev().nth(4))
+                    .map(|mip| {
+                        let a: u32 = mip.iter().skip(3).step_by(4).map(|v| *v as u32).sum();
+                        a as f32 / (255.0 * (mip.len() / 4) as f32)
+                    })
+                    .unwrap_or(1.0)
+                    * m.base_color[3]
+            } else {
+                m.base_color[3]
+            };
+            eprintln!(
+                "  material {i} \"{name}\": {kind}, mean alpha {coverage:.2}{}",
+                if coverage > 0.99 {
+                    "  (already opaque -- nothing to see through)"
+                } else {
+                    ""
+                }
+            );
+        }
+        if m.emissive.iter().any(|&v| v > 0.0) {
+            eprintln!(
+                "  material {i} \"{name}\": emissive {:.2},{:.2},{:.2}",
+                m.emissive[0], m.emissive[1], m.emissive[2]
+            );
+        }
     }
 }
 
@@ -292,7 +415,7 @@ fn visit_node(
     node: &gltf::Node,
     parent: nalgebra::Matrix4<f32>,
     buffers: &[Vec<u8>],
-    mat_layer: &[u32],
+    default_material: u32,
     out: &mut Vec<GpuTri>,
 ) {
     let local = nalgebra::Matrix4::from_column_slice(
@@ -330,11 +453,13 @@ fn visit_node(
                 Some(i) => i.into_u32().collect(),
                 None => (0..positions.len() as u32).collect(),
             };
+            // The index into our material table; primitives with no material
+            // of their own get glTF's default.
             let mat = prim
                 .material()
                 .index()
-                .and_then(|i| mat_layer.get(i).copied())
-                .unwrap_or(0);
+                .map(|i| i as u32)
+                .unwrap_or(default_material);
 
             for tri in indices.chunks_exact(3) {
                 let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
@@ -377,7 +502,7 @@ fn visit_node(
         }
     }
     for child in node.children() {
-        visit_node(&child, xform, buffers, mat_layer, out);
+        visit_node(&child, xform, buffers, default_material, out);
     }
 }
 
@@ -443,43 +568,59 @@ fn texel_density(t: &GpuTri) -> f32 {
     }
 }
 
-/// Decode the base colour images, bring them all to a common size (a texture
-/// array needs uniform dimensions, and the lens texture is half the rest), and
-/// build box-filtered mip chains.
+/// Decode the images, bring them all to a common size (a texture array needs
+/// uniform dimensions, and these rarely agree), and build box-filtered mip
+/// chains.
 ///
 /// Mips are not optional here. A ray tracer samples one point per ray, so a
 /// 2048-square texture on a model a few hundred pixels across would alias into
 /// a shimmering mess -- especially under lensing, which stretches the model
 /// unevenly across the frame.
+///
+/// The common size is the next power of two at or above the largest source,
+/// capped, rather than a fixed 2048: the pony's images are mostly 1024 with one
+/// 2000, and forcing every layer up to 2048 would triple the texture memory to
+/// gain nothing.
 fn load_textures(paths: &[PathBuf]) -> Result<(Vec<Tex>, u32)> {
-    const SIZE: u32 = 2048;
-    let mut layers: Vec<Vec<u8>> = Vec::new();
+    const MAX_SIZE: u32 = 2048;
     if paths.is_empty() {
         // A model with no textures still needs one layer to bind: plain white,
-        // so the shading term shows through unmodified.
-        layers.push(vec![255u8; (SIZE * SIZE * 4) as usize]);
+        // so the base colour factor shows through unmodified.
+        const SIZE: u32 = 4;
+        let white = vec![255u8; (SIZE * SIZE * 4) as usize];
+        return Ok((
+            vec![Tex {
+                mips: mip_chain(white, SIZE),
+            }],
+            SIZE,
+        ));
     }
+
+    let mut images = Vec::with_capacity(paths.len());
+    let mut widest = 1;
     for p in paths {
-        // The glTF chose these paths, so name the texture by its file name --
-        // "the base colour texture X", not "the file you asked for".
         let what = format!(
-            "the base colour texture \"{}\"",
+            "the texture \"{}\"",
             p.file_name().unwrap_or(p.as_os_str()).to_string_lossy()
         );
-        let img = assets::open_image(p, &what)?;
-        let img = if img.width() != SIZE || img.height() != SIZE {
-            image::DynamicImage::ImageRgba8(image::imageops::resize(
-                &img.to_rgba8(),
-                SIZE,
-                SIZE,
-                image::imageops::FilterType::CatmullRom,
-            ))
+        let img = assets::open_image(p, &what)?.to_rgba8();
+        widest = widest.max(img.width()).max(img.height());
+        images.push(img);
+    }
+    let size = widest.next_power_of_two().min(MAX_SIZE);
+
+    let mut out = Vec::with_capacity(images.len());
+    for img in images {
+        let img = if img.width() != size || img.height() != size {
+            image::imageops::resize(&img, size, size, image::imageops::FilterType::CatmullRom)
         } else {
             img
         };
-        layers.push(img.to_rgba8().into_raw());
+        out.push(Tex {
+            mips: mip_chain(img.into_raw(), size),
+        });
     }
-    Ok((layers.into_iter().map(|l| Tex { mips: mip_chain(l, SIZE) }).collect(), SIZE))
+    Ok((out, size))
 }
 
 /// Successive 2x2 box reductions down to 1x1.

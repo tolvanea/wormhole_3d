@@ -43,8 +43,8 @@ once per flight, and hands the GPU a 176-byte uniform block per frame.
    on the throat's photon ring and are painted black — that is the thin dark
    ring you see at the critical impact parameter.
 
-3. **Solid geometry: the chase model.** A glTF model — Khronos's FlightHelmet,
-   94,722 triangles across six primitives — flies the same path 2.5a ahead of
+3. **Solid geometry: the chase model.** A glTF model — a pony in a space suit,
+   39,289 triangles across eleven primitives — flies the same path 2.5a ahead of
    the camera (and 0.7a above the flight plane, so it does not eclipse the
    mouth), turning steadily about its own z axis. Hitting it needs the ray's 3D
    position, which the planar reduction still has: after sweeping φ the ray
@@ -78,7 +78,7 @@ once per flight, and hands the GPU a 176-byte uniform block per frame.
    no bisection afterwards: it lands exactly on the triangle, with barycentric
    coordinates for the normal and the UV.
 
-   The BVH is a binned-SAH build (12 bins, ≤4 triangles per leaf, 65,457 nodes)
+   The BVH is a binned-SAH build (12 bins, ≤4 triangles per leaf, 26,121 nodes)
    flattened depth-first with children allocated in pairs, so one index per
    interior node locates both; the shader walks it iteratively with a 32-deep
    stack, visiting the nearer child first.
@@ -87,17 +87,56 @@ once per flight, and hands the GPU a 176-byte uniform block per frame.
    see a second copy of it inside the mouth's ring, and from the throat it is
    stretched tangentially.
 
-   **Shading and texturing.** Base colour only: the five distinct base colour
-   images become a 2048² texture array, with the material → layer table read
-   from the glTF (the hose and wood parts share one). A ray tracer has no
-   screen-space derivatives to pick a mip from, so each triangle carries
-   √(UV area / world area) and the shader reconstructs a level from that and
-   the width of the ray's cone at the hit — one sample's angular size times the
-   proper distance travelled. Without it a 2048² texture on a model a few
-   hundred pixels across shimmers badly, especially under lensing, which
-   stretches the model unevenly across the frame. Lighting is the same as the
-   sphere's: a Lambert key light plus flat ambient, fixed in the model's own
-   frame, since a distant light source would be a fiction here.
+   **Materials.** Triangles carry a material index, and a small storage buffer
+   holds one record per material: `baseColorFactor` (RGBA), a base colour layer
+   or −1 for none, alpha mode and cutoff, and an emissive colour. Indexing by
+   material rather than straight to a texture layer is what lets a material have
+   no texture at all — the pony's teeth, tongue, eyelashes and glowing pip are
+   pure factors, and pointing those at "layer 0" would paint them with whatever
+   image happened to be first.
+
+   **Base colour and mips.** The distinct images become a texture array, sized
+   to the next power of two at or above the largest source rather than a fixed
+   2048, so a model of mostly-1024 images does not pay triple for one 2000-pixel
+   outlier. A ray tracer has no screen-space derivatives to pick a mip from, so
+   each triangle carries √(UV area / world area) and the shader reconstructs a
+   level from that and the width of the ray's cone at the hit — one sample's
+   angular size times the proper distance travelled. Without it a 2048² texture
+   on a model a few hundred pixels across shimmers badly, especially under
+   lensing, which stretches the model unevenly across the frame.
+
+   **Transparency.** `BLEND` and `MASK` materials are composited front to back
+   along the ray. The march carries a colour and a remaining transmittance; an
+   opaque hit ends the ray, a blended one takes its share (`colour += throughput
+   · α · shade`, `throughput ·= 1 − α`) and lets the rest carry on, and a masked
+   texel below its cutoff costs nothing at all. Whatever transmittance survives
+   to the end multiplies the sky, so a visor still shows the universe through it.
+
+   The subtlety is that a single RK4 step can cross several surfaces — the near
+   and far walls of a helmet dome, most obviously. So each step's segment is
+   walked repeatedly, each pass starting just past the previous hit, until the
+   segment is exhausted or the transmittance drops below a cut-off. The BVH
+   already returns the nearest hit, so front-to-back ordering comes for free and
+   nothing has to be sorted. Note the ray is *not* bent at the interface: there
+   is no refraction here, only absorption, so a lens tints and dims what is
+   behind it but does not displace it.
+
+   **Emission.** `emissiveFactor` is folded together with
+   `KHR_materials_emissive_strength` at load time and added at the hit, with an
+   emissive texture supported but unused by this model. It is deliberately
+   naive: the surface glows at itself and nothing else in the scene is any
+   brighter for it, because with one ray per sample and no secondary rays there
+   is nothing to gather the light with. It reads correctly on the pony's cyan
+   pips and is the term a future path tracer would sample as a light source
+   rather than simply add on arrival.
+
+   Startup prints a line for every non-opaque or emissive material, including
+   the mean alpha of a blended material's texture — a material marked `BLEND`
+   whose texture is solid alpha renders exactly like an opaque one, and that is
+   worth telling apart from the transparency being broken.
+
+   **Lighting** is unchanged: a Lambert key light plus flat ambient, fixed in
+   the model's own frame, since a distant light source would be a fiction here.
 
    Note that the model is scaled to a bounding radius of 0.43a rather than the
    old sphere's 0.25a. A bounding sphere is a loose fit around a helmet, and
@@ -238,6 +277,17 @@ To make an mp4 instead of the gif:
 
 ## Assets
 
+`gltf_models/space_pony` is the default chase model: a pony in a space suit,
+with a `BLEND` visor and an emissive pip.
+
 `gltf_models/FlightHelmet` is the Khronos glTF-Sample-Assets FlightHelmet
-(CC0); see the `LICENSE.md` beside it. Only the base colour textures are used —
-the normal and occlusion/roughness/metallic maps are left on disk.
+(CC0); see the `LICENSE.md` beside it. It still loads — `--model
+gltf_models/FlightHelmet/FlightHelmet.gltf` — and is useful as a
+known-good comparison. Only the base colour textures are used from it; the
+normal and occlusion/roughness/metallic maps are left on disk.
+
+Of the glTF material model this renderer reads `baseColorFactor`,
+`baseColorTexture`, `alphaMode` / `alphaCutoff`, `emissiveFactor`,
+`emissiveTexture` and `KHR_materials_emissive_strength`. Metallic-roughness,
+normal maps and `KHR_materials_transmission` are ignored, so a lens authored as
+transmission rather than as blended alpha will come out opaque.

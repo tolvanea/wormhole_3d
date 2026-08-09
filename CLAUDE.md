@@ -37,6 +37,10 @@ because the shader has already tone mapped and gamma encoded.
   path solving needs f64, the ray tracing needs speed. Keep them in step.
 - Constants that shape the flight live at the top of `scene.rs`. Prefer adding
   one there over hard-coding a number further down.
+- Rays composite front-to-back: the march carries a colour and a remaining
+  transmittance rather than returning on the first hit. Anything new that
+  terminates a ray early has to account for `throughput`, or transparent
+  surfaces silently stop working.
 - Open files through `assets::read` / `assets::open_image` rather than `std::fs`
   or `image::open` directly. They turn a missing file into a message naming the
   asset, the expanded path, how far down it exists, and where the real file is

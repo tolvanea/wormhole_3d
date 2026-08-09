@@ -53,6 +53,27 @@ struct Tri {
     uv2: vec2<f32>, pad6: vec2<f32>,
 }
 
+// glTF's three ways of treating the alpha channel.
+const ALPHA_OPAQUE: u32 = 0u;
+const ALPHA_MASK: u32 = 1u;
+const ALPHA_BLEND: u32 = 2u;
+
+// Below this much remaining transmittance a ray has nothing left to contribute,
+// so stop walking layers. And this many blended surfaces per RK4 step is more
+// than any sane model puts in a tenth of a throat radius.
+const MIN_THROUGHPUT: f32 = 0.004;
+const MAX_LAYERS: u32 = 8u;
+
+struct Material {
+    base_color: vec4<f32>,
+    emissive: vec3<f32>,
+    alpha_cutoff: f32,
+    base_tex: i32,
+    emissive_tex: i32,
+    alpha_mode: u32,
+    pad: u32,
+}
+
 // `count > 0` marks a leaf holding `count` triangles from `left_first`;
 // otherwise the children are `left_first` and `left_first + 1`.
 struct Node {
@@ -69,6 +90,7 @@ struct Node {
 @group(0) @binding(6) var sky_a: texture_cube<f32>;
 @group(0) @binding(7) var sky_b: texture_cube<f32>;
 @group(0) @binding(8) var sky_samp: sampler;
+@group(0) @binding(9) var<storage, read> materials: array<Material>;
 
 // --------------------------- geodesic integrator ---------------------------
 
@@ -149,7 +171,7 @@ struct Hit { t: f32, tri: u32, bu: f32, bv: f32 }
 
 /// Moller-Trumbore, double sided: the helmet has open edges and shells, so
 /// rejecting back faces would punch holes in it.
-fn tri_hit(idx: u32, o: vec3<f32>, d: vec3<f32>, tmax: f32) -> Hit {
+fn tri_hit(idx: u32, o: vec3<f32>, d: vec3<f32>, tmin: f32, tmax: f32) -> Hit {
     var h: Hit;
     h.tri = NO_HIT;
     h.t = tmax;
@@ -167,7 +189,9 @@ fn tri_hit(idx: u32, o: vec3<f32>, d: vec3<f32>, tmax: f32) -> Hit {
     let bv = dot(d, qv) * inv_det;
     if (bv < 0.0 || bu + bv > 1.0) { return h; }
     let t = dot(e2, qv) * inv_det;
-    if (t <= 1e-7 || t >= tmax) { return h; }
+    // tmin excludes the surface we just came through, so a transparent hit does
+    // not find itself again on the next pass.
+    if (t <= tmin || t >= tmax) { return h; }
     h.t = t;
     h.tri = idx;
     h.bu = bu;
@@ -190,7 +214,7 @@ fn slab(bmin: vec3<f32>, bmax: vec3<f32>, o: vec3<f32>, inv: vec3<f32>, tmax: f3
 /// Nearest triangle crossed by the segment o -> o + d, as a parameter in
 /// [0, 1]. Children are visited near-first so the far one is usually culled by
 /// the hit found in the near one.
-fn trace_segment(o: vec3<f32>, d: vec3<f32>) -> Hit {
+fn trace_segment(o: vec3<f32>, d: vec3<f32>, tmin: f32) -> Hit {
     var best: Hit;
     best.t = 1.0; // nothing past the end of this step counts
     best.tri = NO_HIT;
@@ -207,7 +231,7 @@ fn trace_segment(o: vec3<f32>, d: vec3<f32>) -> Hit {
         let n = nodes[node];
         if (n.count > 0u) {
             for (var i = 0u; i < n.count; i = i + 1u) {
-                let h = tri_hit(n.left_first + i, o, d, best.t);
+                let h = tri_hit(n.left_first + i, o, d, tmin, best.t);
                 if (h.tri != NO_HIT) { best = h; }
             }
             if (sp == 0u) { break; }
@@ -254,17 +278,22 @@ fn sky(n: vec3<f32>, side: f32) -> vec3<f32> {
     return c * U.sky_gain;
 }
 
-/// Base colour times a Lambert key light and a flat ambient term.
+/// Base colour times a Lambert key light and a flat ambient term, plus any
+/// emission, with the material's alpha in w.
 ///
 /// The light is fixed in the model's own frame, so it stays lit the same way
 /// all the way round -- a distant light source would be a fiction here, with
 /// two universes and no time coordinate to propagate it along.
-fn shade(h: Hit, d: vec3<f32>, dist: f32) -> vec3<f32> {
+///
+/// Emission is returned already added in. It is deliberately naive: the surface
+/// glows at itself, and nothing else in the scene is any brighter for it, since
+/// with one ray per sample and no secondary rays there is nothing to gather the
+/// light. When this grows a path tracer, this is the term to sample as a light
+/// source rather than to add on arrival.
+fn shade(h: Hit, d: vec3<f32>, dist: f32) -> vec4<f32> {
     let tr = tris[h.tri];
+    let m = materials[tr.mat];
     let w = 1.0 - h.bu - h.bv;
-    var n = normalize(tr.n0 * w + tr.n1 * h.bu + tr.n2 * h.bv);
-    // Double-sided geometry: face the normal back towards the incoming ray.
-    if (dot(n, d) > 0.0) { n = -n; }
     let uv = tr.uv0 * w + tr.uv1 * h.bu + tr.uv2 * h.bv;
 
     // No screen-space derivatives in a ray tracer, so the mip level comes from
@@ -274,13 +303,40 @@ fn shade(h: Hit, d: vec3<f32>, dist: f32) -> vec3<f32> {
     if (tr.uv_density > 0.0) {
         lod = log2(max(dist * U.pixel_angle * tr.uv_density * U.tex_size, 1.0));
     }
-    let albedo = textureSampleLevel(model_tex, model_samp, uv, tr.mat, lod).rgb;
+
+    var base = m.base_color;
+    if (m.base_tex >= 0) {
+        base = base * textureSampleLevel(model_tex, model_samp, uv, m.base_tex, lod);
+    }
+
+    // Resolve alpha before shading, so a masked-out or fully clear texel costs
+    // nothing more.
+    var alpha = base.a;
+    if (m.alpha_mode == ALPHA_OPAQUE) {
+        alpha = 1.0;
+    } else if (m.alpha_mode == ALPHA_MASK) {
+        if (alpha < m.alpha_cutoff) { return vec4<f32>(0.0); }
+        alpha = 1.0;
+    }
+    if (alpha <= 0.0) { return vec4<f32>(0.0); }
+
+    var n = normalize(tr.n0 * w + tr.n1 * h.bu + tr.n2 * h.bv);
+    // Double-sided geometry: face the normal back towards the incoming ray. A
+    // transparent shell gets hit from the inside on the way out, and without
+    // this its far wall would shade as though lit from behind.
+    if (dot(n, d) > 0.0) { n = -n; }
 
     // The model turns about its own z, so its normals sit in a frame rotated
     // by -spin from the body frame the light is defined in; rotate back.
     let nb = vec3<f32>(n.x * U.spin_c - n.y * U.spin_s, n.x * U.spin_s + n.y * U.spin_c, n.z);
     let k = 0.25 + 1.15 * max(dot(nb, U.light), 0.0);
-    return albedo * k;
+
+    var rgb = base.rgb * k;
+    var emissive = m.emissive;
+    if (m.emissive_tex >= 0) {
+        emissive = emissive * textureSampleLevel(model_tex, model_samp, uv, m.emissive_tex, lod).rgb;
+    }
+    return vec4<f32>(rgb + emissive, alpha);
 }
 
 // ------------------------------- ray casting -------------------------------
@@ -304,6 +360,13 @@ fn ray_color(d: vec3<f32>) -> vec3<f32> {
     var s = GS(U.cam_l, 0.0, vl0, vph0 / sqrt(U.cam_l * U.cam_l + U.a * U.a));
     var arc = 0.0;
 
+    // Front-to-back compositing. `colour` is what has been gathered so far and
+    // `throughput` is how much of what lies beyond still gets through. An
+    // opaque hit ends the ray; a blended one takes its share and lets the rest
+    // carry on, which is what makes the visor show the pony behind it.
+    var colour = vec3<f32>(0.0);
+    var throughput = 1.0;
+
     for (var step = 0u; step < U.max_steps; step = step + 1u) {
         let r = sqrt(s.l * s.l + U.a * U.a);
         if (abs(s.l) > U.l_escape && s.l * s.vl > 0.0) {
@@ -314,7 +377,7 @@ fn ray_color(d: vec3<f32>) -> vec3<f32> {
             let p_f = u_at(p_hat, t_hat, s.phi);
             let t_f = t_at(p_hat, t_hat, s.phi);
             let n = normalize(p_f * (s.vl * side) + t_f * (r * s.vphi));
-            return sky(n, side);
+            return colour + throughput * sky(n, side);
         }
 
         // Step size grows with distance from the throat: the geometry (and the
@@ -339,20 +402,37 @@ fn ray_color(d: vec3<f32>) -> vec3<f32> {
 
         let next = rk4_step(s, h);
         if (near) {
-            // The segment test needs no bisection refinement: unlike the
-            // sphere's inside/outside test, it lands exactly on the triangle.
+            // The segment test needs no bisection refinement: unlike a sphere's
+            // inside/outside test, it lands exactly on the triangle.
             let a0 = to_model(s.l, u_now);
             let a1 = to_model(next.l, u_at(p_hat, t_hat, next.phi));
             let seg = a1 - a0;
-            let hit = trace_segment(a0, seg);
-            if (hit.tri != NO_HIT) {
-                return shade(hit, normalize(seg), arc + hit.t * h);
+            let dir = normalize(seg);
+            // Walk every surface this step crosses, nearest first. Without the
+            // loop a blended surface would swallow the step and whatever sits
+            // just behind it -- the far wall of the visor, say -- would be
+            // skipped entirely.
+            var tmin = 0.0;
+            for (var layer = 0u; layer < MAX_LAYERS; layer = layer + 1u) {
+                let hit = trace_segment(a0, seg, tmin);
+                if (hit.tri == NO_HIT) { break; }
+                let surf = shade(hit, dir, arc + hit.t * h);
+                colour = colour + throughput * surf.a * surf.rgb;
+                throughput = throughput * (1.0 - surf.a);
+                if (throughput < MIN_THROUGHPUT) { return colour; }
+                // Step just past this surface. The nudge is relative to the
+                // segment parameter, and the segment is a fraction of the
+                // model's radius, so it is far below any real feature.
+                tmin = hit.t + 1e-5;
+                if (tmin >= 1.0) { break; }
             }
         }
         s = next;
         arc = arc + h;
     }
-    return vec3<f32>(0.0); // photon ring: never escapes
+    // Photon ring: never escapes, so nothing more arrives. Whatever was picked
+    // up on the way stays, over black.
+    return colour;
 }
 
 fn tonemap(c: vec3<f32>) -> vec3<f32> {
