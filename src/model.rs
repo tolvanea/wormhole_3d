@@ -276,6 +276,15 @@ impl Model {
         let mip_levels = textures[0].mips.len() as u32;
         let nodes = build_bvh(&mut tris);
 
+        // The local box, in the model's own frame: +x is the way it faces
+        // (towards the chasing camera), +z is up. Worth printing because the
+        // flight plan puts the camera a fixed distance out along +x, and how
+        // close it can get before it is inside the model depends on this.
+        let (lo, hi) = bounds_of(&tris);
+        eprintln!(
+            "model: local box x {:+.2}..{:+.2} (faces +x), y {:+.2}..{:+.2}, z {:+.2}..{:+.2}",
+            lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]
+        );
         eprintln!(
             "model: {} triangles, {} BVH nodes, {} material(s), {} texture layer(s) \
              at {}x{} ({} mips)",

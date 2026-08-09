@@ -46,7 +46,9 @@ once per flight, and hands the GPU a 176-byte uniform block per frame.
 3. **Solid geometry: the chase model.** A glTF model — a pony in a space suit,
    39,289 triangles across eleven primitives — flies the same path 2.5a ahead of
    the camera (and 0.7a above the flight plane, so it does not eclipse the
-   mouth), turning steadily about its own z axis. Hitting it needs the ray's 3D
+   mouth). It can turn about its own z axis, though `MODEL_TURNS` is 0 for this
+   flight: the camera is doing the moving, and a spinning subject fights that.
+   Hitting it needs the ray's 3D
    position, which the planar reduction still has: after sweeping φ the ray
    sits at angular position u(φ) = p̂ cos φ + t̂ sin φ, so each RK4 step gives a
    manifold point (l, u).
@@ -150,8 +152,25 @@ once per flight, and hands the GPU a 176-byte uniform block per frame.
 4. **Camera path.** The camera is a point (l, u) — radial coordinate plus a
    position on the sphere of radius r(l) = √(l² + a²) — carrying an
    orthonormal (forward, up) frame, so it can look anywhere, not just down
-   the axis. The whole flight is a single continuous move; nothing stops and
-   there are no acts to stitch together.
+   the axis. The flight reads as two acts but is built as a single continuous
+   move; nothing stops and there is no join to stitch.
+
+   **The approach** (`INTRO_FRAMES`, 42 of 168). The pony drifts backwards
+   towards the wormhole — she faces the camera the whole way, so the mouth is
+   behind her and largely hidden by her — while the camera withdraws from just
+   off her face (`INTRO_DIST_START`, 0.6a) to the distance it keeps thereafter
+   (`ORBIT_DIST`, 2.5a). Nothing rotates yet. Aimed at her centre from that
+   range the shot would be of her chest, so during the approach the camera also
+   looks `INTRO_AIM` above centre, onto her eyes, settling back to the centre as
+   it withdraws.
+
+   Both ramps are smootherstep in l rather than smoothstep, because its *second*
+   derivative vanishes at the ends too: the pull-back has to arrive at the
+   crossing with no residual acceleration or the join reads as a small lurch.
+   The bearing is clamped at zero over this stretch, so the turn begins exactly
+   when the camera reaches its final distance.
+
+   **The crossing** (`FRAMES`, 126) is everything below.
 
    The model flies the path. l runs monotonically +14a → −14a while the model
    also slides around the throat sphere by
@@ -196,6 +215,17 @@ once per flight, and hands the GPU a 176-byte uniform block per frame.
    Keying that blend to l instead is a subtle trap: during the orbit the camera
    swings beside and even ahead of the model, so an l-keyed weight releases far
    too early and the model silently leaves the shot for a third of the flight.
+
+   The two acts get the frames they were asked for. Left alone the split would
+   fall out of whatever the geometry happened to measure, which is no way to tune
+   a shot — and the measure badly overstates the approach, since it counts the
+   camera's absolute travel while the pony travels with it and the sky is at
+   infinity, so almost nothing on screen actually changes. So the approach's
+   share of the measure is scaled by a factor solved for in closed form (the
+   measure is linear in it), applied through the same smootherstep as the
+   distance ramp so that it is exactly 1 at the join and introduces no speed
+   step. Startup reports the split it actually achieved against the one asked
+   for; they agree to within a frame.
 
    The timing comes from measuring, not from a formula. `pose_at` defines the
    *curve* — a purely geometric object with no timing in it — and then the curve
@@ -247,7 +277,7 @@ Offline, to disk:
 
     cargo run --release -- --render
 
-Outputs `out/frame_###.png` (126 frames, 1920×1080, 2×2 supersampled) and an
+Outputs `out/frame_###.png` (168 frames, 1920×1080, 2×2 supersampled) and an
 animated `out/wormhole.gif`. Both modes trace with the same shader into the
 same texture — the window blits it through a deliberately non-sRGB surface so
 that what you see is byte-for-byte what gets written.
@@ -258,16 +288,20 @@ automatically). The scene constants live at the top of `src/scene.rs`:
 
 | | |
 | --- | --- |
-| `A`, `FOV_DEG`, `FRAMES` | throat radius, field of view, length of the flight |
-| `L_START` / `L_END` | how far out the flight starts and ends |
+| `A`, `FOV_DEG` | throat radius, field of view |
+| `INTRO_FRAMES` / `FRAMES` | frames for the approach and for the crossing |
+| `L_INTRO_START` | how far out the approach begins |
+| `INTRO_DIST_START` / `INTRO_AIM` | how close the camera starts to the model, and how far up it looks while there |
+| `L_START` / `L_END` | where the crossing begins and ends |
 | `LOOP_SWEEP` | how far the path loops around the throat while crossing |
 | `ORBIT_TURNS` / `ORBIT_SPREAD` | turns the camera makes around the model, and how tightly they cluster at the wormhole |
 | `ORBIT_DIST` / `LOOK_GRIP` | how far the camera stands off, and how firmly it holds the model once it swings to the side |
 | `THROAT_DWELL` | extra frames spent on the crossing, beyond what even motion already gives it |
 | `END_RAMP` | how much of the flight is spent getting up to speed and back down |
-| `MODEL_R` / `MODEL_LEAD` / `MODEL_RISE` / `MODEL_TURNS` | the chase model's size, lead, height above the flight plane, and spin |
+| `MODEL_R` / `MODEL_LEAD` / `MODEL_RISE` | the chase model's size, lead, and height above the flight plane |
+| `MODEL_TURNS` | turns the model makes about its own axis; 0 keeps it still |
 
-For reference, the full 126-frame 1080p 2×2 render takes about 26 s end to end
+For reference, the full 168-frame 1080p 2×2 render takes about 26 s end to end
 on an RX 7900 — and most of that is PNG and GIF encoding on the CPU, with the
 slowest frame tracing in 0.06 s.
 

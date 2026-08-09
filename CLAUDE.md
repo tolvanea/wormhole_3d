@@ -37,6 +37,10 @@ because the shader has already tone mapped and gamma encoded.
   path solving needs f64, the ray tracing needs speed. Keep them in step.
 - Constants that shape the flight live at the top of `scene.rs`. Prefer adding
   one there over hard-coding a number further down.
+- The flight is one continuous curve; the "two acts" are just ramps keyed to
+  `l`, not separate code paths. Frames are placed by walking that curve and
+  measuring view change, so anything that changes `pose_at` changes the timing
+  too — check the startup lines rather than assuming.
 - Rays composite front-to-back: the march carries a colour and a remaining
   transmittance rather than returning on the first hit. Anything new that
   terminates a ray early has to account for `throughput`, or transparent
