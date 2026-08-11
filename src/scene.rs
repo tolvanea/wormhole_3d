@@ -30,8 +30,8 @@ pub const A: f64 = 1.0; // throat radius (sets the length unit)
 
 pub const FOV_DEG: f64 = 80.0; // horizontal field of view
 
-pub const L_START: f64 = 14.0; // camera starts here (universe A) ...
-pub const L_END: f64 = -14.0; // ... and ends here (universe B)
+pub const L_START: f64 = 15.0; // camera starts here (universe A) ...
+pub const L_END: f64 = -22.0; // ... and ends here (universe B)
 
 /// The camera does not fall straight down the axis: while it crosses it also
 /// slides around the throat sphere by LOOP_SWEEP radians (half a turn), almost
@@ -52,8 +52,8 @@ pub const LOOP_SWEEP: f64 = PI;
 /// Frames spent on the approach, and on the crossing. Both are honoured
 /// exactly: the pacing solves for the split rather than hoping for it, and the
 /// startup line reports what it actually got.
-pub const INTRO_FRAMES: usize = 122;
-pub const FRAMES: usize = 252;
+pub const INTRO_FRAMES: usize = 12*140;
+pub const FRAMES: usize = 12*280;
 
 /// Where the approach begins. The wormhole is a speck at this range, and the
 /// pony is between the camera and it.
@@ -66,11 +66,17 @@ pub const L_INTRO_START: f64 = 40.0 * A;
 /// startup warns if it does not. The default sits just off her face.
 pub const INTRO_DIST_START: f64 = 0.35 * A;
 
-/// How far up the model the camera looks during the approach, in proper units
-/// above its centre. Aimed at the centre it would be staring at her chest from
-/// that range; this lifts the shot onto her eyes and settles back to the centre
-/// as the camera withdraws.
-pub const INTRO_AIM: f64 = 0.35 * A;
+/// How high the camera *sits* above the model's centre at the start of the
+/// approach, and how high it *looks*, both in proper units. Each falls to zero
+/// by the time the crossing begins, so over the approach the camera draws back
+/// and slightly down onto the flight axis.
+///
+/// The model's box runs -0.35..+0.35 vertically (the loader prints it), so 0.22
+/// puts it at eye height on the pony. With the two equal the camera stands at her
+/// eyes and looks level at them; setting AIM above RISE tilts the shot up,
+/// below it tilts down.
+pub const INTRO_RISE: f64 = 0.15 * A;
+pub const INTRO_AIM: f64 = 0.15 * A;
 
 
 /// Turns the camera makes around the model over the whole flight.
@@ -127,7 +133,7 @@ pub const LOOK_GRIP: f64 = 0.65;
 /// surface that rays actually hit sits far closer to the centre than 0.43a.
 /// Turn it down if you would rather have the geometry exact than legible.
 pub const MODEL_R: f64 = 0.43 * A;
-pub const MODEL_LEAD: f64 = 2.5 * A; // how far ahead of the camera it flies
+pub const MODEL_LEAD: f64 = 2.0 * A; // how far ahead of the camera it flies
 /// How far it flies above the flight plane, so that it does not eclipse the
 /// wormhole mouth on the way in.
 pub const MODEL_RISE: f64 = 0.7 * A;
@@ -448,6 +454,20 @@ fn aim_at(l: f64) -> f64 {
     INTRO_AIM * intro_t(l)
 }
 
+/// How far above the model's centre the camera is standing at `l`.
+fn rise_at(l: f64) -> f64 {
+    INTRO_RISE * intro_t(l)
+}
+
+/// The camera's actual distance from the model's centre. `dist_at` is the
+/// standoff measured along the flight axis and the rise is perpendicular to it,
+/// so the two combine as the legs of a right triangle.
+fn standoff_at(l: f64) -> f64 {
+    let d = dist_at(l);
+    let h = rise_at(l);
+    (d * d + h * h).sqrt()
+}
+
 /// Where the camera is, and where the model is, when the model has reached `l`.
 ///
 /// The camera is placed by firing a geodesic *out of* the model and standing at
@@ -466,8 +486,15 @@ fn pose_at(l: f64) -> Shot {
     // place.
     let behind = -path_tangent(body.l);
     let bearing = bearing_at(l);
-    let e = rotate_about(behind, V3::z(), bearing);
-    let (cl, cu, at_model) = orbit_camera(&body, e, dist_at(l));
+    // The launch direction, lifted out of the flight plane by the approach's
+    // rise. `behind` lies in the plane and the bearing turns it about +z, so the
+    // lift stays perpendicular to it and the geodesic simply sets off at an
+    // angle -- which is what puts the camera up at her eyes rather than merely
+    // pointing at them.
+    let flat = rotate_about(behind, V3::z(), bearing);
+    let rise = rise_at(l);
+    let e = (flat * dist_at(l) + V3::z() * rise).normalize();
+    let (cl, cu, at_model) = orbit_camera(&body, e, standoff_at(l));
     // Facing straight back down the geodesic holds the model in the middle of
     // the frame, which is what an orbit should do -- but held for the whole
     // flight it also parks the model right in front of the wormhole mouth and
@@ -491,14 +518,19 @@ fn pose_at(l: f64) -> Shot {
         at_model
     };
 
-    // Tilt up onto the model's head for the close approach. Rotating about
-    // (fwd x up) is what swings the view towards `up`: for a small angle the
-    // rotation moves fwd by (fwd x up) x fwd, which is exactly up.
-    let aim = aim_at(l);
-    if aim.abs() > 1e-9 {
+    // Aim off the flight axis for the close approach. Standing at height `rise`
+    // and looking along the flight already sights a point that high on the
+    // model, so only the difference between where it looks and where it stands
+    // wants correcting -- with the two equal the view comes out level at her
+    // eyes, and no tilt is applied at all.
+    //
+    // Rotating about (fwd x up) is what swings the view towards `up`: for a
+    // small angle the rotation moves fwd by (fwd x up) x fwd, which is up.
+    let tilt = ((aim_at(l) - rise) / dist_at(l)).atan();
+    if tilt.abs() > 1e-9 {
         let axis = fwd.cross(&up_for(fwd));
         if axis.norm() > 1e-9 {
-            fwd = rotate_about(fwd, axis.normalize(), (aim / dist_at(l)).atan());
+            fwd = rotate_about(fwd, axis.normalize(), tilt);
         }
     }
 
@@ -612,7 +644,7 @@ pub fn flight_plan() -> Vec<Shot> {
         // Weighted so the throat can be given more frames than even motion
         // alone would hand it.
         let dwell = 1.0 + (THROAT_DWELL - 1.0) / (1.0 + (mid / ORBIT_SPREAD).powi(2));
-        step.push(dwell * view_change(&prev, &cam, dist_at(mid)));
+        step.push(dwell * view_change(&prev, &cam, standoff_at(mid)));
         share.push(intro_t(mid));
         prev = cam;
     }
@@ -713,15 +745,19 @@ pub fn report_continuity(shots: &[Shot]) {
         shots.len(),
         shots[0].body.l,
         shots[intro].body.l,
-        dist_at(param(&shots[0])),
-        dist_at(param(&shots[intro])),
+        standoff_at(param(&shots[0])),
+        standoff_at(param(&shots[intro])),
         INTRO_FRAMES,
     );
-    if INTRO_DIST_START <= MODEL_R {
+    // The camera and the rise are perpendicular, so this is how far out the
+    // first frame really stands -- which is the number that has to clear the
+    // model, not INTRO_DIST_START on its own.
+    let start_out = (INTRO_DIST_START * INTRO_DIST_START + INTRO_RISE * INTRO_RISE).sqrt();
+    if start_out <= MODEL_R {
         eprintln!(
-            "  warning: INTRO_DIST_START {:.2} is inside the model's bounding radius {:.2}; \
-             the camera may start inside it",
-            INTRO_DIST_START, MODEL_R
+            "  WARNING: the camera starts {start_out:.2} out, within the model's {MODEL_R:.2} \
+             bounding radius. If the first frames show the inside of its faces, that is why -- \
+             raise INTRO_DIST_START, or lower INTRO_RISE."
         );
     }
 

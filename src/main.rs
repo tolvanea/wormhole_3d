@@ -19,8 +19,8 @@ use scene::Shot;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const SKY_A: &str = "cubemap/cubemap_1.jpg"; // sky seen at l -> +inf
-const SKY_B: &str = "cubemap/cubemap_2.png"; // sky seen at l -> -inf
+const SKY_A: &str = "cubemap/milky_way_x2.png"; // sky seen at l -> +inf
+const SKY_B: &str = "cubemap/ponyville_original_resolution.png"; // sky seen at l -> -inf
 const MODEL: &str = "gltf_models/space_pony/space_pony.gltf";
 
 const GIF_EVERY: usize = 1; // put every n-th frame into the GIF
@@ -175,7 +175,7 @@ fn render_headless(
         for (px, out) in rgba.chunks_exact(4).zip(img.pixels_mut()) {
             *out = image::Rgb([px[0], px[1], px[2]]);
         }
-        let path = format!("out/frame_{:03}.png", f);
+        let path = format!("out/frame_{:04}.png", f);
         img.save(&path)
             .with_context(|| format!("cannot write frame {} to {path}", f + 1))?;
         eprintln!(

@@ -155,14 +155,25 @@ once per flight, and hands the GPU a 176-byte uniform block per frame.
    the axis. The flight reads as two acts but is built as a single continuous
    move; nothing stops and there is no join to stitch.
 
-   **The approach** (`INTRO_FRAMES`, 42 of 168). The pony drifts backwards
-   towards the wormhole — she faces the camera the whole way, so the mouth is
-   behind her and largely hidden by her — while the camera withdraws from just
-   off her face (`INTRO_DIST_START`, 0.6a) to the distance it keeps thereafter
-   (`ORBIT_DIST`, 2.5a). Nothing rotates yet. Aimed at her centre from that
-   range the shot would be of her chest, so during the approach the camera also
-   looks `INTRO_AIM` above centre, onto her eyes, settling back to the centre as
-   it withdraws.
+   **The approach** (`INTRO_FRAMES`). The pony drifts backwards towards the
+   wormhole — she faces the camera the whole way, so the mouth is behind her and
+   largely hidden by her — while the camera withdraws from just off her face
+   (`INTRO_DIST_START`) to the distance it keeps thereafter (`ORBIT_DIST`, 2.5a).
+   Nothing rotates yet.
+
+   The camera also *stands* `INTRO_RISE` above the flight axis and *looks*
+   `INTRO_AIM` above it, both falling to zero by the crossing, so it drifts back
+   and slightly down onto the axis over the approach. Standing at eye height and
+   looking level is not the same shot as standing on the axis and tilting up:
+   the first is a portrait, the second looks up her nose. With the two constants
+   equal the view comes out level — the geodesic is fired out of the flight
+   plane by the rise, and only the *difference* between where the camera looks
+   and where it stands is applied as a tilt, so equal values mean no tilt at all.
+
+   Note that `INTRO_DIST_START` and `INTRO_RISE` are perpendicular, so what has
+   to clear the model is √(dist² + rise²), not either alone. Below the model's
+   bounding radius the opening frames render the inside of its faces; startup
+   warns when that is the case.
 
    Both ramps are smootherstep in l rather than smoothstep, because its *second*
    derivative vanishes at the ends too: the pull-back has to arrive at the
@@ -291,7 +302,8 @@ automatically). The scene constants live at the top of `src/scene.rs`:
 | `A`, `FOV_DEG` | throat radius, field of view |
 | `INTRO_FRAMES` / `FRAMES` | frames for the approach and for the crossing |
 | `L_INTRO_START` | how far out the approach begins |
-| `INTRO_DIST_START` / `INTRO_AIM` | how close the camera starts to the model, and how far up it looks while there |
+| `INTRO_DIST_START` | how close the camera starts to the model, along the flight axis |
+| `INTRO_RISE` / `INTRO_AIM` | how high it stands, and how high it looks; equal values give a level shot |
 | `L_START` / `L_END` | where the crossing begins and ends |
 | `LOOP_SWEEP` | how far the path loops around the throat while crossing |
 | `ORBIT_TURNS` / `ORBIT_SPREAD` | turns the camera makes around the model, and how tightly they cluster at the wormhole |
