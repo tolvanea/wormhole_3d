@@ -30,8 +30,8 @@ pub const A: f64 = 1.0; // throat radius (sets the length unit)
 
 pub const FOV_DEG: f64 = 80.0; // horizontal field of view
 
-pub const L_START: f64 = 15.0; // camera starts here (universe A) ...
-pub const L_END: f64 = -22.0; // ... and ends here (universe B)
+pub const L_START: f64 = 10.0; // camera starts here (universe A) ...
+pub const L_END: f64 = -15.0; // ... and ends here (universe B)
 
 /// The camera does not fall straight down the axis: while it crosses it also
 /// slides around the throat sphere by LOOP_SWEEP radians (half a turn), almost
@@ -52,8 +52,8 @@ pub const LOOP_SWEEP: f64 = PI;
 /// Frames spent on the approach, and on the crossing. Both are honoured
 /// exactly: the pacing solves for the split rather than hoping for it, and the
 /// startup line reports what it actually got.
-pub const INTRO_FRAMES: usize = 12*140;
-pub const FRAMES: usize = 12*280;
+pub const INTRO_FRAMES: usize = 12*150;
+pub const FRAMES: usize = 12*260;
 
 /// Where the approach begins. The wormhole is a speck at this range, and the
 /// pony is between the camera and it.
@@ -440,6 +440,7 @@ fn intro_t(l: f64) -> f64 {
         return 0.0;
     }
     let x = ((l - L_START) / (L_INTRO_START - L_START)).clamp(0.0, 1.0);
+    let x = x.powf(1.2);
     x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
 }
 
