@@ -73,4 +73,3 @@ ffmpeg -framerate 60 -pattern_type glob -i '*.png' -c:v libx264 -pix_fmt yuv420p
 * Salaryman for writing a [guide](https://sfmlab.com/tutorials/view/be13f1f3-a517-4c38-aee6-47cb116add39/) to port SFM models to blender
 * [SourceIO](https://github.com/REDxEYE/SourceIO) for porting SFM models to blender.
 * EStories for [ponyville background](https://www.deviantart.com/estories/art/Ponyville-Large-1163632729)
-* European southern observatory for the [milky way panorama](https://www.eso.org/public/images/eso0932a/)

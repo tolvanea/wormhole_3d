@@ -19,7 +19,7 @@ use scene::Shot;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const SKY_A: &str = "cubemap/milky_way_by_eso.png.png"; // sky seen at l -> +inf
+const SKY_A: &str = "cubemap/milky_way_crotch.png"; // sky seen at l -> +inf
 const SKY_B: &str = "cubemap/ponyville_by_estories_mirrored.png"; // sky seen at l -> -inf
 const MODEL: &str = "gltf_models/space_pony/space_pony.gltf";
 
