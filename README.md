@@ -2,7 +2,7 @@
 
 ![img](./frame_2258.png)
 
-Ray tracer that renders a camera flight *through* an Ellis
+Wgpu ray tracer that renders a camera flight *through* an Ellis
 wormhole, either live in a window or offline to PNG frames. There is no time
 and no gravity: light rays are simply geodesics of the static 3D spatial
 metric
@@ -16,6 +16,8 @@ l ∈ (−∞, +∞) is proper radial distance; l > 0 is "universe A", l < 0 is
 The whole per-pixel integration runs as a wgpu compute shader
 (`src/tracer.wgsl`); the CPU side (`src/scene.rs`) only solves the camera path,
 once per flight, and hands the GPU a 176-byte uniform block per frame.
+
+Claude code was heavily used with this project, as you may see.
 
 ## How it works
 See [math.md](/math.md) for more.
