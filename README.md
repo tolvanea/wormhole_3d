@@ -1,6 +1,6 @@
 # Ellis wormhole fly-through renderer
 
-A Rust + wgpu ray tracer that renders a camera flight *through* an Ellis
+Ray tracer that renders a camera flight *through* an Ellis
 wormhole, either live in a window or offline to PNG frames. There is no time
 and no gravity: light rays are simply geodesics of the static 3D spatial
 metric
