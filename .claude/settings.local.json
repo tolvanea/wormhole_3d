@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "defaultMode": "acceptEdits",
-    "allow": [
-      "Bash(cargo build *)",
-      "Bash(./target/release/wormhole)"
-    ]
-  }
-}
